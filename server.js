@@ -70,12 +70,28 @@ function isValidTrack(track) {
 function extractTrack(stopId) {
   if (!stopId) return null;
   
-  // Handle formats: NYK_13, NY_13, etc.
-  const match = stopId.match(/(?:NYK?|NY)_(\d+)/i);
+  // Try multiple patterns
+  // Pattern 1: NYK_13, NY_13
+  let match = stopId.match(/(?:NYK?|NY)_(\d+)/i);
   if (match && match[1]) {
     const track = match[1];
-    return isValidTrack(track) ? track : null;
+    if (isValidTrack(track)) return track;
   }
+  
+  // Pattern 2: Just the stop ID might be the track number
+  match = stopId.match(/(\d+)$/);
+  if (match && match[1]) {
+    const track = match[1];
+    if (isValidTrack(track)) return track;
+  }
+  
+  // Pattern 3: Look for any number in the string
+  match = stopId.match(/\d+/);
+  if (match && match[0]) {
+    const track = match[0];
+    if (isValidTrack(track)) return track;
+  }
+  
   return null;
 }
 
@@ -142,16 +158,26 @@ function parseFeed(buffer) {
     const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(buffer);
     const trackAssignments = [];
     
+    // DEBUG: Log feed info
+    console.log(`\n=== FEED DEBUG ===`);
+    console.log(`Total entities in feed: ${feed.entity.length}`);
+    
+    let tripUpdateCount = 0;
+    let pennStationStops = 0;
+    const allStopIds = new Set();
+    const allRouteIds = new Set();
+    
     for (const entity of feed.entity) {
       if (!entity.tripUpdate) continue;
+      tripUpdateCount++;
       
       const trip = entity.tripUpdate.trip;
       const stopTimeUpdates = entity.tripUpdate.stopTimeUpdate || [];
       
       // Get route (destination)
       const routeId = trip.routeId;
+      if (routeId) allRouteIds.add(routeId);
       const destination = DESTINATIONS[routeId];
-      if (!destination) continue;
       
       // Extract train number from trip_id (format: varies)
       const trainNum = trip.tripId?.split('_')[0] || null;
@@ -159,12 +185,21 @@ function parseFeed(buffer) {
       // Look for Penn Station stops with track assignments
       for (const stop of stopTimeUpdates) {
         const stopId = stop.stopId;
+        if (stopId) allStopIds.add(stopId);
         
         // Check if this is Penn Station (NYK or NY prefix)
         if (!stopId || !stopId.match(/^NYK?|^NY/i)) continue;
+        pennStationStops++;
+        
+        console.log(`Penn Station stop found: ${stopId}, Route: ${routeId}, Destination: ${destination}`);
         
         const track = extractTrack(stopId);
-        if (!track) continue;
+        if (!track) {
+          console.log(`  → No track extracted from ${stopId}`);
+          continue;
+        }
+        
+        console.log(`  → Track ${track} extracted!`);
         
         // Determine if arrival or departure
         const arrivalTime = stop.arrival?.time;
@@ -181,6 +216,13 @@ function parseFeed(buffer) {
         });
       }
     }
+    
+    console.log(`\nTrip updates: ${tripUpdateCount}`);
+    console.log(`Penn Station stops found: ${pennStationStops}`);
+    console.log(`Sample stop IDs: ${Array.from(allStopIds).slice(0, 10).join(', ')}`);
+    console.log(`Route IDs: ${Array.from(allRouteIds).join(', ')}`);
+    console.log(`Track assignments extracted: ${trackAssignments.length}`);
+    console.log(`=== END DEBUG ===\n`);
     
     return trackAssignments;
     
@@ -406,6 +448,49 @@ app.get('/api/trains', async (req, res) => {
   } catch (error) {
     console.error('Error fetching trains:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// API: Debug endpoint - see raw feed structure
+app.get('/api/debug', async (req, res) => {
+  try {
+    const buffer = await fetchMTAData();
+    
+    if (!buffer) {
+      return res.status(503).json({ error: 'Unable to fetch MTA data' });
+    }
+    
+    const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(buffer);
+    
+    // Sample first few entities to see structure
+    const samples = feed.entity.slice(0, 5).map(entity => {
+      if (!entity.tripUpdate) return null;
+      
+      const trip = entity.tripUpdate.trip;
+      const stops = entity.tripUpdate.stopTimeUpdate || [];
+      
+      return {
+        tripId: trip.tripId,
+        routeId: trip.routeId,
+        destination: DESTINATIONS[trip.routeId],
+        stops: stops.map(stop => ({
+          stopId: stop.stopId,
+          stopName: stop.stopId,
+          hasArrival: !!stop.arrival,
+          hasDeparture: !!stop.departure
+        }))
+      };
+    }).filter(Boolean);
+    
+    res.json({
+      totalEntities: feed.entity.length,
+      samples,
+      message: 'This shows the structure of data in the MTA feed'
+    });
+    
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
