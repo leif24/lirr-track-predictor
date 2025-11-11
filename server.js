@@ -163,9 +163,10 @@ function parseFeed(buffer) {
     console.log(`Total entities in feed: ${feed.entity.length}`);
     
     let tripUpdateCount = 0;
-    let pennStationStops = 0;
+    let stopsWithPlatform = 0;
     const allStopIds = new Set();
     const allRouteIds = new Set();
+    const stopExamples = [];
     
     for (const entity of feed.entity) {
       if (!entity.tripUpdate) continue;
@@ -179,48 +180,64 @@ function parseFeed(buffer) {
       if (routeId) allRouteIds.add(routeId);
       const destination = DESTINATIONS[routeId];
       
-      // Extract train number from trip_id (format: varies)
+      // Extract train number from trip_id
       const trainNum = trip.tripId?.split('_')[0] || null;
       
-      // Look for Penn Station stops with track assignments
+      // Check ALL stops for track/platform info
       for (const stop of stopTimeUpdates) {
         const stopId = stop.stopId;
         if (stopId) allStopIds.add(stopId);
         
-        // Check if this is Penn Station (NYK or NY prefix)
-        if (!stopId || !stopId.match(/^NYK?|^NY/i)) continue;
-        pennStationStops++;
+        // Look for platform code (this might be the track!)
+        const platformCode = stop.platformCode;
         
-        console.log(`Penn Station stop found: ${stopId}, Route: ${routeId}, Destination: ${destination}`);
-        
-        const track = extractTrack(stopId);
-        if (!track) {
-          console.log(`  → No track extracted from ${stopId}`);
-          continue;
+        // Save examples of stops with platform codes
+        if (platformCode && stopExamples.length < 5) {
+          stopExamples.push({
+            stopId,
+            platformCode,
+            routeId,
+            destination
+          });
         }
         
-        console.log(`  → Track ${track} extracted!`);
-        
-        // Determine if arrival or departure
-        const arrivalTime = stop.arrival?.time;
-        const departureTime = stop.departure?.time;
-        
-        trackAssignments.push({
-          destination,
-          track,
-          trainNum,
-          routeId,
-          isArrival: !!arrivalTime && !departureTime,
-          isDeparture: !!departureTime,
-          timestamp: new Date((departureTime || arrivalTime) * 1000)
-        });
+        if (platformCode) {
+          stopsWithPlatform++;
+          
+          // Check if platform code is a valid track (1-21)
+          const track = platformCode.toString();
+          if (isValidTrack(track)) {
+            // Determine if arrival or departure
+            const arrivalTime = stop.arrival?.time;
+            const departureTime = stop.departure?.time;
+            
+            // Only include if we have a destination
+            if (destination) {
+              console.log(`✅ Found: Stop ${stopId}, Platform ${platformCode}, Route ${routeId} (${destination})`);
+              
+              trackAssignments.push({
+                destination,
+                track,
+                trainNum,
+                routeId,
+                isArrival: !!arrivalTime && !departureTime,
+                isDeparture: !!departureTime,
+                timestamp: new Date((departureTime || arrivalTime) * 1000)
+              });
+            }
+          }
+        }
       }
     }
     
     console.log(`\nTrip updates: ${tripUpdateCount}`);
-    console.log(`Penn Station stops found: ${pennStationStops}`);
+    console.log(`Stops with platform codes: ${stopsWithPlatform}`);
     console.log(`Sample stop IDs: ${Array.from(allStopIds).slice(0, 10).join(', ')}`);
     console.log(`Route IDs: ${Array.from(allRouteIds).join(', ')}`);
+    console.log(`\nExample stops with platforms:`);
+    stopExamples.forEach(ex => {
+      console.log(`  Stop ${ex.stopId}: Platform "${ex.platformCode}" - ${ex.destination || 'Unknown'}`);
+    });
     console.log(`Track assignments extracted: ${trackAssignments.length}`);
     console.log(`=== END DEBUG ===\n`);
     
