@@ -163,7 +163,7 @@ function parseFeed(buffer) {
     console.log(`Total entities in feed: ${feed.entity.length}`);
     
     let tripUpdateCount = 0;
-    let stopsWithPlatform = 0;
+    let pennStationStops = 0;
     const allStopIds = new Set();
     const allRouteIds = new Set();
     const stopExamples = [];
@@ -183,68 +183,136 @@ function parseFeed(buffer) {
       // Extract train number from trip_id
       const trainNum = trip.tripId?.split('_')[0] || null;
       
-      // Check ALL stops for track/platform info
+      // Look for Penn Station stops
       for (const stop of stopTimeUpdates) {
         const stopId = stop.stopId;
         if (stopId) allStopIds.add(stopId);
         
-        // Look for platform code (this might be the track!)
-        const platformCode = stop.platformCode;
-        
-        // Save examples of stops with platform codes
-        if (platformCode && stopExamples.length < 5) {
-          stopExamples.push({
-            stopId,
-            platformCode,
-            routeId,
-            destination
-          });
-        }
-        
-        if (platformCode) {
-          stopsWithPlatform++;
+        // Save examples of ALL stops for debugging
+        if (stopExamples.length < 10) {
+          const stopInfo = {
+            stopId: stopId,
+            stopName: stop.stopName || 'N/A',
+            platformCode: stop.platformCode || 'N/A',
+            routeId: routeId,
+            destination: destination || 'Unknown',
+            hasExtension: !!stop.mta_railroad_stop_time_update,
+            extensionFields: []
+          };
           
-          // Check if platform code is a valid track (1-21)
-          const track = platformCode.toString();
-          if (isValidTrack(track)) {
-            // Determine if arrival or departure
-            const arrivalTime = stop.arrival?.time;
-            const departureTime = stop.departure?.time;
-            
-            // Only include if we have a destination
-            if (destination) {
-              console.log(`✅ Found: Stop ${stopId}, Platform ${platformCode}, Route ${routeId} (${destination})`);
-              
-              trackAssignments.push({
-                destination,
-                track,
-                trainNum,
-                routeId,
-                isArrival: !!arrivalTime && !departureTime,
-                isDeparture: !!departureTime,
-                timestamp: new Date((departureTime || arrivalTime) * 1000)
-              });
+          // Check for MTA Railroad extension (LIRR/Metro-North)
+          if (stop.mta_railroad_stop_time_update) {
+            const mtaExt = stop.mta_railroad_stop_time_update;
+            stopInfo.extensionFields.push('mta_railroad_stop_time_update');
+            if (mtaExt.track) {
+              stopInfo.track = mtaExt.track;
             }
           }
+          
+          stopExamples.push(stopInfo);
+        }
+        
+        // Check if this is Penn Station (stop_id = 237)
+        const isPennStation = stopId === '237';
+        
+        if (!isPennStation) continue;
+        
+        pennStationStops++;
+        console.log(`\n🔍 Penn Station found! Stop ID: ${stopId}`);
+        console.log(`   Route: ${routeId} (${destination || 'Unknown'})`);
+        console.log(`   All keys in stop object:`, Object.keys(stop));
+        
+        // Log the entire stop object structure (first occurrence only)
+        if (pennStationStops === 1) {
+          console.log(`   Full stop object:`, JSON.stringify(stop, null, 2));
+        }        
+        // Try to get track from LIRR extension - try multiple access patterns
+        let track = null;
+        
+        // Method 1: Direct property access
+        if (stop.mta_railroad_stop_time_update) {
+          const mtaExt = stop.mta_railroad_stop_time_update;
+          console.log(`   ✓ Method 1: Has mta_railroad_stop_time_update property`);
+          console.log(`   Keys:`, Object.keys(mtaExt));
+          if (mtaExt.track) {
+            track = mtaExt.track.toString();
+            console.log(`   ✅ Track from direct property: ${track}`);
+          }
+        }
+        
+        // Method 2: Extension by field number (1005)
+        if (!track && stop[1005]) {
+          console.log(`   ✓ Method 2: Has extension field [1005]`);
+          console.log(`   Extension content:`, stop[1005]);
+          if (stop[1005].track) {
+            track = stop[1005].track.toString();
+            console.log(`   ✅ Track from extension [1005]: ${track}`);
+          }
+        }
+        
+        // Method 3: Check extensions object
+        if (!track && stop.extensions) {
+          console.log(`   ✓ Method 3: Has extensions object`);
+          console.log(`   Extensions:`, stop.extensions);
+          if (stop.extensions[1005] && stop.extensions[1005].track) {
+            track = stop.extensions[1005].track.toString();
+            console.log(`   ✅ Track from extensions[1005]: ${track}`);
+          }
+        }
+        
+        if (!track) {
+          console.log(`   ❌ No track found in any extension method`);
+        }
+        
+        // Try platformCode as fallback
+        if (!track && stop.platformCode) {
+          track = stop.platformCode.toString();
+          console.log(`   Track from platformCode: ${track}`);
+        }
+        
+        // Validate track
+        if (track && isValidTrack(track)) {
+          const arrivalTime = stop.arrival?.time;
+          const departureTime = stop.departure?.time;
+          
+          if (destination) {
+            console.log(`   ✅ VALID TRACK ASSIGNMENT: ${destination} → Track ${track}`);
+            
+            trackAssignments.push({
+              destination,
+              track,
+              trainNum,
+              routeId,
+              isArrival: !!arrivalTime && !departureTime,
+              isDeparture: !!departureTime,
+              timestamp: new Date((departureTime || arrivalTime) * 1000)
+            });
+          }
+        } else {
+          console.log(`   ❌ No valid track found`);
         }
       }
     }
     
-    console.log(`\nTrip updates: ${tripUpdateCount}`);
-    console.log(`Stops with platform codes: ${stopsWithPlatform}`);
-    console.log(`Sample stop IDs: ${Array.from(allStopIds).slice(0, 10).join(', ')}`);
+    console.log(`\n=== SUMMARY ===`);
+    console.log(`Trip updates: ${tripUpdateCount}`);
+    console.log(`Penn Station stops found: ${pennStationStops}`);
+    console.log(`Sample stop IDs: ${Array.from(allStopIds).slice(0, 20).join(', ')}`);
     console.log(`Route IDs: ${Array.from(allRouteIds).join(', ')}`);
-    console.log(`\nExample stops with platforms:`);
-    stopExamples.forEach(ex => {
-      console.log(`  Stop ${ex.stopId}: Platform "${ex.platformCode}" - ${ex.destination || 'Unknown'}`);
+    console.log(`\nFirst 10 stops in feed:`);
+    stopExamples.forEach((ex, idx) => {
+      console.log(`  ${idx + 1}. Stop "${ex.stopId}" - ${ex.destination}`);
+      console.log(`     Platform: ${ex.platformCode}, Extension: ${ex.extensionFields.join(', ') || 'none'}`);
+      if (ex.track) console.log(`     TRACK: ${ex.track}`);
     });
-    console.log(`Track assignments extracted: ${trackAssignments.length}`);
+    console.log(`\n✅ Track assignments extracted: ${trackAssignments.length}`);
     console.log(`=== END DEBUG ===\n`);
     
     return trackAssignments;
     
   } catch (error) {
     console.error('Error parsing feed:', error);
+    console.error(error.stack);
     return [];
   }
 }
