@@ -1,20 +1,31 @@
 const express = require('express');
-const cors = require('cors');
-const GtfsRealtimeBindings = require('gtfs-realtime-bindings');
 const fetch = require('node-fetch');
+const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// LIRR GTFS-RT Feed URL
-const MTA_FEED_URL = 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/lirr%2Fgtfs-lirr';
-const POLL_INTERVAL = 30000; // 30 seconds
-const STALE_THRESHOLD = 300000; // 5 minutes
+// Enable CORS
+app.use(cors());
+app.use(express.json());
 
-// Route ID to destination mapping
+// LIRR TrainTime API endpoint (no API key needed!)
+const TRAINTIME_API = 'https://traintime.lirr.org/api/Departure?loc=NYK';
+
+// In-memory storage
+const memoryStorage = new Map();
+
+// Storage stats
+const storageStats = {
+  successfulFetches: 0,
+  failedFetches: 0,
+  lastUpdate: null
+};
+
+// Destination mapping
 const DESTINATIONS = {
   '1': 'Babylon',
-  '2': 'Far Rockaway',
+  '2': 'Far Rockaway', 
   '3': 'Hempstead',
   '4': 'Long Beach',
   '5': 'West Hempstead',
@@ -27,80 +38,34 @@ const DESTINATIONS = {
   '12': 'Montauk'
 };
 
-// Seed patterns (fallback data with low confidence)
+// Seed data: Known common patterns
 const SEED_PATTERNS = {
-  'Babylon': [13, 15, 17],
-  'Port Washington': [4, 6, 8],
-  'Huntington': [9, 11, 13],
-  'Ronkonkoma': [13, 15, 17, 19],
-  'Hempstead': [1, 3, 5],
-  'Far Rockaway': [1, 3, 5],
-  'Port Jefferson': [9, 11, 13],
-  'Long Beach': [1, 3, 5],
-  'West Hempstead': [1, 3, 5],
-  'Oyster Bay': [4, 6, 8],
-  'Greenport': [9, 11],
-  'Montauk': [13, 15, 17]
+  'Babylon': { tracks: [13, 15, 17], confidence: 35 },
+  'Far Rockaway': { tracks: [3, 5], confidence: 35 },
+  'Hempstead': { tracks: [11, 13, 15], confidence: 35 },
+  'Long Beach': { tracks: [1, 3, 5], confidence: 35 },
+  'West Hempstead': { tracks: [11, 13, 15], confidence: 35 },
+  'Oyster Bay': { tracks: [17, 19], confidence: 35 },
+  'Port Jefferson': { tracks: [17, 19, 21], confidence: 35 },
+  'Ronkonkoma': { tracks: [13, 15, 17], confidence: 35 },
+  'Greenport': { tracks: [21], confidence: 35 },
+  'Port Washington': { tracks: [17, 19, 21], confidence: 35 },
+  'Huntington': { tracks: [17, 19], confidence: 35 },
+  'Montauk': { tracks: [13, 15], confidence: 35 }
 };
 
-// In-memory storage (fallback if Claude storage unavailable)
-let memoryStorage = new Map();
-let storageStats = {
-  totalPatterns: 0,
-  lastUpdate: null,
-  successfulFetches: 0,
-  failedFetches: 0,
-  isHealthy: true
-};
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Utility: Sleep function for retry backoff
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Utility: Validate track number
 function isValidTrack(track) {
   const trackNum = parseInt(track);
   return trackNum >= 1 && trackNum <= 21;
 }
 
-// Utility: Extract track from stop_id (e.g., "NYK_13" -> "13")
-function extractTrack(stopId) {
-  if (!stopId) return null;
-  
-  // Try multiple patterns
-  // Pattern 1: NYK_13, NY_13
-  let match = stopId.match(/(?:NYK?|NY)_(\d+)/i);
-  if (match && match[1]) {
-    const track = match[1];
-    if (isValidTrack(track)) return track;
-  }
-  
-  // Pattern 2: Just the stop ID might be the track number
-  match = stopId.match(/(\d+)$/);
-  if (match && match[1]) {
-    const track = match[1];
-    if (isValidTrack(track)) return track;
-  }
-  
-  // Pattern 3: Look for any number in the string
-  match = stopId.match(/\d+/);
-  if (match && match[0]) {
-    const track = match[0];
-    if (isValidTrack(track)) return track;
-  }
-  
-  return null;
-}
-
-// Storage wrapper with fallback
 async function setStorage(key, value) {
   try {
     memoryStorage.set(key, value);
-    // In production, this would call Claude storage API
-    // For now, using in-memory storage
     return true;
   } catch (error) {
     console.error('Storage error:', error);
@@ -117,22 +82,21 @@ async function getStorage(key) {
   }
 }
 
-// Fetch MTA data with retry logic
-async function fetchMTAData() {
+async function fetchTrainTimeData() {
   const maxRetries = 3;
   
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      console.log(`Fetching MTA feed (attempt ${attempt + 1}/${maxRetries})...`);
+      console.log(`Fetching TrainTime API (attempt ${attempt + 1}/${maxRetries})...`);
       
-      const response = await fetch(MTA_FEED_URL);
+      const response = await fetch(TRAINTIME_API);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
       
-      const buffer = await response.arrayBuffer();
-      return Buffer.from(buffer);
+      const data = await response.json();
+      return data;
       
     } catch (error) {
       console.error(`Fetch attempt ${attempt + 1} failed:`, error.message);
@@ -142,7 +106,6 @@ async function fetchMTAData() {
         return null;
       }
       
-      // Exponential backoff: 1s, 2s, 4s
       const backoffMs = 1000 * Math.pow(2, attempt);
       console.log(`Retrying in ${backoffMs}ms...`);
       await sleep(backoffMs);
@@ -152,458 +115,283 @@ async function fetchMTAData() {
   return null;
 }
 
-// Parse GTFS-RT feed and extract track assignments
-function parseFeed(buffer) {
-  try {
-    const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(buffer);
-    const trackAssignments = [];
+function parseTrainTimeData(data) {
+  const trackAssignments = [];
+  
+  if (!data || !data.TRAINS) {
+    console.log('No TRAINS data in response');
+    return trackAssignments;
+  }
+  
+  console.log(`\n=== TRAINTIME API DEBUG ===`);
+  console.log(`Total trains: ${data.TRAINS.length}`);
+  
+  let trainsWithTracks = 0;
+  
+  for (const train of data.TRAINS) {
+    const destination = train.DEST;
+    const track = train.TRACK;
+    const trainNum = train.TRAIN_ID;
+    const scheduledTime = train.SCHED;
     
-    // DEBUG: Log feed info
-    console.log(`\n=== FEED DEBUG ===`);
-    console.log(`Total entities in feed: ${feed.entity.length}`);
+    // Only process if track is assigned
+    if (!track || track === '*' || track === '') continue;
     
-    let tripUpdateCount = 0;
-    let pennStationStops = 0;
-    const allStopIds = new Set();
-    const allRouteIds = new Set();
-    const stopExamples = [];
-    
-    for (const entity of feed.entity) {
-      if (!entity.tripUpdate) continue;
-      tripUpdateCount++;
-      
-      const trip = entity.tripUpdate.trip;
-      const stopTimeUpdates = entity.tripUpdate.stopTimeUpdate || [];
-      
-      // Get route (destination)
-      const routeId = trip.routeId;
-      if (routeId) allRouteIds.add(routeId);
-      const destination = DESTINATIONS[routeId];
-      
-      // Extract train number from trip_id
-      const trainNum = trip.tripId?.split('_')[0] || null;
-      
-      // Look for Penn Station stops
-      for (const stop of stopTimeUpdates) {
-        const stopId = stop.stopId;
-        if (stopId) allStopIds.add(stopId);
-        
-        // Save examples of ALL stops for debugging
-        if (stopExamples.length < 10) {
-          const stopInfo = {
-            stopId: stopId,
-            stopName: stop.stopName || 'N/A',
-            platformCode: stop.platformCode || 'N/A',
-            routeId: routeId,
-            destination: destination || 'Unknown',
-            hasExtension: !!stop.mta_railroad_stop_time_update,
-            extensionFields: []
-          };
-          
-          // Check for MTA Railroad extension (LIRR/Metro-North)
-          if (stop.mta_railroad_stop_time_update) {
-            const mtaExt = stop.mta_railroad_stop_time_update;
-            stopInfo.extensionFields.push('mta_railroad_stop_time_update');
-            if (mtaExt.track) {
-              stopInfo.track = mtaExt.track;
-            }
-          }
-          
-          stopExamples.push(stopInfo);
-        }
-        
-        // Check if this is Penn Station (stop_id = 237)
-        const isPennStation = stopId === '237';
-        
-        if (!isPennStation) continue;
-        
-        pennStationStops++;
-        console.log(`\n🔍 Penn Station found! Stop ID: ${stopId}`);
-        console.log(`   Route: ${routeId} (${destination || 'Unknown'})`);
-        console.log(`   All keys in stop object:`, Object.keys(stop));
-        
-        // Log the entire stop object structure (first occurrence only)
-        if (pennStationStops === 1) {
-          console.log(`   Full stop object:`, JSON.stringify(stop, null, 2));
-        }        
-        // Try to get track from LIRR extension - try multiple access patterns
-        let track = null;
-        
-        // Method 1: Direct property access
-        if (stop.mta_railroad_stop_time_update) {
-          const mtaExt = stop.mta_railroad_stop_time_update;
-          console.log(`   ✓ Method 1: Has mta_railroad_stop_time_update property`);
-          console.log(`   Keys:`, Object.keys(mtaExt));
-          if (mtaExt.track) {
-            track = mtaExt.track.toString();
-            console.log(`   ✅ Track from direct property: ${track}`);
-          }
-        }
-        
-        // Method 2: Extension by field number (1005)
-        if (!track && stop[1005]) {
-          console.log(`   ✓ Method 2: Has extension field [1005]`);
-          console.log(`   Extension content:`, stop[1005]);
-          if (stop[1005].track) {
-            track = stop[1005].track.toString();
-            console.log(`   ✅ Track from extension [1005]: ${track}`);
-          }
-        }
-        
-        // Method 3: Check extensions object
-        if (!track && stop.extensions) {
-          console.log(`   ✓ Method 3: Has extensions object`);
-          console.log(`   Extensions:`, stop.extensions);
-          if (stop.extensions[1005] && stop.extensions[1005].track) {
-            track = stop.extensions[1005].track.toString();
-            console.log(`   ✅ Track from extensions[1005]: ${track}`);
-          }
-        }
-        
-        if (!track) {
-          console.log(`   ❌ No track found in any extension method`);
-        }
-        
-        // Try platformCode as fallback
-        if (!track && stop.platformCode) {
-          track = stop.platformCode.toString();
-          console.log(`   Track from platformCode: ${track}`);
-        }
-        
-        // Validate track
-        if (track && isValidTrack(track)) {
-          const arrivalTime = stop.arrival?.time;
-          const departureTime = stop.departure?.time;
-          
-          if (destination) {
-            console.log(`   ✅ VALID TRACK ASSIGNMENT: ${destination} → Track ${track}`);
-            
-            trackAssignments.push({
-              destination,
-              track,
-              trainNum,
-              routeId,
-              isArrival: !!arrivalTime && !departureTime,
-              isDeparture: !!departureTime,
-              timestamp: new Date((departureTime || arrivalTime) * 1000)
-            });
-          }
-        } else {
-          console.log(`   ❌ No valid track found`);
-        }
-      }
+    // Validate track number
+    if (!isValidTrack(track)) {
+      console.log(`⚠️  Invalid track: ${track} for ${destination}`);
+      continue;
     }
     
-    console.log(`\n=== SUMMARY ===`);
-    console.log(`Trip updates: ${tripUpdateCount}`);
-    console.log(`Penn Station stops found: ${pennStationStops}`);
-    console.log(`Sample stop IDs: ${Array.from(allStopIds).slice(0, 20).join(', ')}`);
-    console.log(`Route IDs: ${Array.from(allRouteIds).join(', ')}`);
-    console.log(`\nFirst 10 stops in feed:`);
-    stopExamples.forEach((ex, idx) => {
-      console.log(`  ${idx + 1}. Stop "${ex.stopId}" - ${ex.destination}`);
-      console.log(`     Platform: ${ex.platformCode}, Extension: ${ex.extensionFields.join(', ') || 'none'}`);
-      if (ex.track) console.log(`     TRACK: ${ex.track}`);
+    trainsWithTracks++;
+    console.log(`✅ ${destination} → Track ${track} (Train ${trainNum})`);
+    
+    trackAssignments.push({
+      destination,
+      track,
+      trainNum,
+      scheduledTime,
+      timestamp: new Date()
     });
-    console.log(`\n✅ Track assignments extracted: ${trackAssignments.length}`);
-    console.log(`=== END DEBUG ===\n`);
-    
-    return trackAssignments;
-    
-  } catch (error) {
-    console.error('Error parsing feed:', error);
-    console.error(error.stack);
-    return [];
   }
+  
+  console.log(`Trains with tracks assigned: ${trainsWithTracks}`);
+  console.log(`=== END DEBUG ===\n`);
+  
+  return trackAssignments;
 }
 
-// Store track pattern
-async function storePattern(assignment) {
-  try {
+async function learnFromAssignments(assignments) {
+  if (assignments.length === 0) return;
+  
+  const patterns = await getStorage('patterns') || {};
+  
+  for (const assignment of assignments) {
     const { destination, track, trainNum, timestamp } = assignment;
     
-    const date = new Date(timestamp);
-    const dayOfWeek = date.getDay(); // 0-6
-    const hour = date.getHours(); // 0-23
-    
-    // Build storage key for specific train pattern
-    const key = `track:${destination}:${dayOfWeek}:${hour}:${trainNum}`;
-    
-    // Get existing pattern
-    let pattern = await getStorage(key);
-    
-    if (!pattern) {
-      pattern = {
-        tracks: {},
-        mostCommon: track,
-        confidence: 0,
-        count: 0,
-        alternatives: [],
-        lastSeen: timestamp.toISOString()
-      };
+    if (!patterns[destination]) {
+      patterns[destination] = {};
     }
     
-    // Update track counts
-    pattern.tracks[track] = (pattern.tracks[track] || 0) + 1;
-    pattern.count++;
-    pattern.lastSeen = timestamp.toISOString();
-    
-    // Calculate most common track
-    const sortedTracks = Object.entries(pattern.tracks)
-      .sort((a, b) => b[1] - a[1]);
-    
-    pattern.mostCommon = sortedTracks[0][0];
-    
-    // Calculate confidence based on consistency
-    const maxCount = sortedTracks[0][1];
-    pattern.confidence = Math.min(95, Math.round((maxCount / pattern.count) * 100));
-    
-    // Get alternatives (other tracks used more than once)
-    pattern.alternatives = sortedTracks
-      .slice(1)
-      .filter(([_, count]) => count > 1)
-      .map(([track]) => track);
-    
-    await setStorage(key, pattern);
-    
-    // Store recent arrival for inbound matching
-    if (assignment.isArrival) {
-      const arrivalKey = `arrival:${destination}:recent`;
-      await setStorage(arrivalKey, {
+    // Store by train number
+    if (trainNum) {
+      if (!patterns[destination][trainNum]) {
+        patterns[destination][trainNum] = [];
+      }
+      
+      patterns[destination][trainNum].push({
         track,
         timestamp: timestamp.toISOString(),
-        trainNum
+        hour: timestamp.getHours()
       });
+      
+      // Keep only last 100 observations per train
+      if (patterns[destination][trainNum].length > 100) {
+        patterns[destination][trainNum] = patterns[destination][trainNum].slice(-100);
+      }
     }
     
-    return true;
-    
-  } catch (error) {
-    console.error('Error storing pattern:', error);
-    return false;
-  }
-}
-
-// Update learning statistics
-async function updateStats() {
-  try {
-    storageStats.lastUpdate = new Date().toISOString();
-    storageStats.isHealthy = Date.now() - new Date(storageStats.lastUpdate) < STALE_THRESHOLD;
-    
-    // Count total patterns
-    let count = 0;
-    for (const key of memoryStorage.keys()) {
-      if (key.startsWith('track:')) count++;
+    // Store general destination patterns
+    if (!patterns[destination]['_general']) {
+      patterns[destination]['_general'] = [];
     }
-    storageStats.totalPatterns = count;
     
-    await setStorage('stats:learning', storageStats);
+    patterns[destination]['_general'].push({
+      track,
+      timestamp: timestamp.toISOString(),
+      trainNum
+    });
     
-  } catch (error) {
-    console.error('Error updating stats:', error);
+    // Keep only last 500 observations per destination
+    if (patterns[destination]['_general'].length > 500) {
+      patterns[destination]['_general'] = patterns[destination]['_general'].slice(-500);
+    }
   }
-}
-
-// Main learning loop
-async function learningLoop() {
-  console.log('Starting LIRR Track Predictor learning service...');
   
-  while (true) {
-    try {
-      const buffer = await fetchMTAData();
-      
-      if (buffer) {
-        const assignments = parseFeed(buffer);
-        console.log(`Found ${assignments.length} track assignments`);
-        
-        for (const assignment of assignments) {
-          await storePattern(assignment);
-        }
-        
-        storageStats.successfulFetches++;
-        await updateStats();
-        
-        console.log(`Stats: ${storageStats.totalPatterns} patterns, ${storageStats.successfulFetches} successful fetches`);
-      }
-      
-    } catch (error) {
-      console.error('Error in learning loop:', error);
-      storageStats.failedFetches++;
-    }
-    
-    // Wait before next poll
-    await sleep(POLL_INTERVAL);
-  }
+  await setStorage('patterns', patterns);
+  console.log(`Learned ${assignments.length} new patterns`);
 }
 
-// API: Get prediction for a train
-app.get('/api/predict', async (req, res) => {
-  try {
-    const { destination, trainNum } = req.query;
-    
-    if (!destination) {
-      return res.status(400).json({ error: 'Destination required' });
-    }
-    
-    const now = new Date();
-    const dayOfWeek = now.getDay();
-    const hour = now.getHours();
-    
-    const predictions = [];
-    
-    // Method 1: Inbound matching (highest confidence)
-    const arrivalKey = `arrival:${destination}:recent`;
-    const recentArrival = await getStorage(arrivalKey);
-    
-    if (recentArrival) {
-      const arrivalTime = new Date(recentArrival.timestamp);
-      const minutesAgo = (now - arrivalTime) / 1000 / 60;
-      
-      // Only use if within 15 minutes
-      if (minutesAgo <= 15) {
-        predictions.push({
-          method: 'inbound_match',
-          track: recentArrival.track,
-          confidence: 85,
-          reason: `Train arrived on Track ${recentArrival.track} ${Math.round(minutesAgo)} min ago`
-        });
-      }
-    }
-    
-    // Method 2: Historical pattern for specific train
-    if (trainNum) {
-      const key = `track:${destination}:${dayOfWeek}:${hour}:${trainNum}`;
-      const pattern = await getStorage(key);
-      
-      if (pattern && pattern.count >= 2) {
-        predictions.push({
-          method: 'historical_pattern',
-          track: pattern.mostCommon,
-          confidence: pattern.confidence,
-          alternatives: pattern.alternatives,
-          reason: `Train #${trainNum} historically uses Track ${pattern.mostCommon} (${pattern.count} times observed)`
-        });
-      }
-    }
-    
-    // Method 3: General branch patterns (seed data)
-    if (SEED_PATTERNS[destination]) {
+function getPredictions(destination, trainNum = null) {
+  const patterns = memoryStorage.get('patterns') || {};
+  const predictions = [];
+  
+  const destPattern = patterns[destination];
+  
+  if (!destPattern) {
+    // Return seed data only
+    const seedData = SEED_PATTERNS[destination];
+    if (seedData) {
       predictions.push({
         method: 'branch_pattern',
-        tracks: SEED_PATTERNS[destination],
-        confidence: 35,
-        reason: `${destination} trains typically use tracks: ${SEED_PATTERNS[destination].join(', ')}`
+        tracks: seedData.tracks,
+        confidence: seedData.confidence,
+        reason: `${destination} trains typically use tracks: ${seedData.tracks.join(', ')}`
       });
     }
-    
-    // Return predictions sorted by confidence
-    predictions.sort((a, b) => b.confidence - a.confidence);
-    
-    res.json({
-      destination,
-      trainNum: trainNum || null,
-      predictions,
-      timestamp: now.toISOString()
-    });
-    
-  } catch (error) {
-    console.error('Prediction error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return predictions;
   }
-});
-
-// API: Get current trains (all departures)
-app.get('/api/trains', async (req, res) => {
-  try {
-    const buffer = await fetchMTAData();
+  
+  // If train number specified, check for historical pattern
+  if (trainNum && destPattern[trainNum]) {
+    const trainHistory = destPattern[trainNum];
+    const trackCounts = {};
     
-    if (!buffer) {
-      return res.status(503).json({ error: 'Unable to fetch MTA data' });
+    for (const observation of trainHistory) {
+      trackCounts[observation.track] = (trackCounts[observation.track] || 0) + 1;
     }
     
-    const assignments = parseFeed(buffer);
-    const departures = assignments.filter(a => a.isDeparture);
+    const sortedTracks = Object.entries(trackCounts)
+      .sort((a, b) => b[1] - a[1]);
     
-    res.json({
-      departures,
-      count: departures.length,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    console.error('Error fetching trains:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    if (sortedTracks.length > 0) {
+      const [topTrack, count] = sortedTracks[0];
+      const confidence = Math.min(95, Math.round((count / trainHistory.length) * 100));
+      
+      predictions.push({
+        method: 'historical_pattern',
+        track: topTrack,
+        confidence,
+        reason: `Train #${trainNum} has used Track ${topTrack} in ${count} of ${trainHistory.length} recent observations`,
+        alternatives: sortedTracks.slice(1, 3).map(([track]) => track)
+      });
+    }
   }
-});
-
-// API: Debug endpoint - see raw feed structure
-app.get('/api/debug', async (req, res) => {
-  try {
-    const buffer = await fetchMTAData();
+  
+  // General destination patterns
+  if (destPattern['_general']) {
+    const generalHistory = destPattern['_general'];
+    const trackCounts = {};
     
-    if (!buffer) {
-      return res.status(503).json({ error: 'Unable to fetch MTA data' });
+    const recentObservations = generalHistory.slice(-50);
+    for (const observation of recentObservations) {
+      trackCounts[observation.track] = (trackCounts[observation.track] || 0) + 1;
     }
     
-    const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(buffer);
+    const sortedTracks = Object.entries(trackCounts)
+      .sort((a, b) => b[1] - a[1]);
     
-    // Sample first few entities to see structure
-    const samples = feed.entity.slice(0, 5).map(entity => {
-      if (!entity.tripUpdate) return null;
+    if (sortedTracks.length > 0) {
+      const topTracks = sortedTracks.slice(0, 3).map(([track]) => track);
+      const [topTrack, count] = sortedTracks[0];
+      const confidence = Math.min(85, Math.round((count / recentObservations.length) * 100));
       
-      const trip = entity.tripUpdate.trip;
-      const stops = entity.tripUpdate.stopTimeUpdate || [];
-      
-      return {
-        tripId: trip.tripId,
-        routeId: trip.routeId,
-        destination: DESTINATIONS[trip.routeId],
-        stops: stops.map(stop => ({
-          stopId: stop.stopId,
-          stopName: stop.stopId,
-          hasArrival: !!stop.arrival,
-          hasDeparture: !!stop.departure
-        }))
-      };
-    }).filter(Boolean);
-    
-    res.json({
-      totalEntities: feed.entity.length,
-      samples,
-      message: 'This shows the structure of data in the MTA feed'
-    });
-    
-  } catch (error) {
-    console.error('Debug error:', error);
-    res.status(500).json({ error: error.message });
+      predictions.push({
+        method: 'destination_pattern',
+        track: topTrack,
+        confidence,
+        reason: `${destination} trains recently used Track ${topTrack} most often (${count}/${recentObservations.length} times)`,
+        alternatives: sortedTracks.slice(1, 3).map(([track]) => track)
+      });
+    }
   }
-});
+  
+  // Add seed data as fallback
+  const seedData = SEED_PATTERNS[destination];
+  if (seedData && predictions.length === 0) {
+    predictions.push({
+      method: 'branch_pattern',
+      tracks: seedData.tracks,
+      confidence: seedData.confidence,
+      reason: `${destination} trains typically use tracks: ${seedData.tracks.join(', ')}`
+    });
+  }
+  
+  predictions.sort((a, b) => b.confidence - a.confidence);
+  
+  return predictions;
+}
 
-// API: Health check
+async function startLearningService() {
+  console.log('Starting LIRR Track Predictor learning service...');
+  
+  async function fetchAndLearn() {
+    try {
+      const data = await fetchTrainTimeData();
+      
+      if (data) {
+        const assignments = parseTrainTimeData(data);
+        console.log(`Found ${assignments.length} track assignments`);
+        
+        if (assignments.length > 0) {
+          await learnFromAssignments(assignments);
+          storageStats.successfulFetches++;
+          storageStats.lastUpdate = new Date().toISOString();
+        }
+        
+        const patterns = await getStorage('patterns') || {};
+        const totalPatterns = Object.keys(patterns).reduce((sum, dest) => {
+          return sum + Object.keys(patterns[dest]).length;
+        }, 0);
+        
+        console.log(`Stats: ${totalPatterns} patterns, ${storageStats.successfulFetches} successful fetches`);
+      }
+    } catch (error) {
+      console.error('Error in learning loop:', error);
+    }
+  }
+  
+  await fetchAndLearn();
+  setInterval(fetchAndLearn, 30000);
+}
+
+// API Routes
 app.get('/health', async (req, res) => {
-  const stats = await getStorage('stats:learning') || storageStats;
+  const patterns = await getStorage('patterns') || {};
+  const totalPatterns = Object.keys(patterns).reduce((sum, dest) => {
+    return sum + Object.keys(patterns[dest]).length;
+  }, 0);
   
-  const health = {
-    status: stats.isHealthy ? 'healthy' : 'stale',
-    ...stats,
-    uptime: process.uptime()
-  };
+  const isHealthy = storageStats.lastUpdate && 
+    (Date.now() - new Date(storageStats.lastUpdate).getTime() < 300000);
   
-  res.json(health);
+  res.json({
+    status: isHealthy ? 'healthy' : 'stale',
+    totalPatterns,
+    lastUpdate: storageStats.lastUpdate,
+    successfulFetches: storageStats.successfulFetches,
+    failedFetches: storageStats.failedFetches,
+    uptime: process.uptime(),
+    isHealthy
+  });
 });
 
-// API: Get learning statistics
 app.get('/api/stats', async (req, res) => {
-  const stats = await getStorage('stats:learning') || storageStats;
-  res.json(stats);
+  const patterns = await getStorage('patterns') || {};
+  const totalPatterns = Object.keys(patterns).reduce((sum, dest) => {
+    return sum + Object.keys(patterns[dest]).length;
+  }, 0);
+  
+  res.json({
+    totalPatterns,
+    lastUpdate: storageStats.lastUpdate,
+    successfulFetches: storageStats.successfulFetches,
+    failedFetches: storageStats.failedFetches,
+    destinations: Object.keys(patterns)
+  });
 });
 
-// Start server
+app.get('/api/predict', async (req, res) => {
+  const { destination, trainNum } = req.query;
+  
+  if (!destination) {
+    return res.status(400).json({ error: 'Destination parameter required' });
+  }
+  
+  const predictions = getPredictions(destination, trainNum);
+  
+  res.json({
+    destination,
+    trainNum: trainNum || null,
+    predictions,
+    generatedAt: new Date().toISOString()
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`API endpoint: http://localhost:${PORT}/api/predict?destination=Babylon&trainNum=2739`);
   
-  // Start learning loop in background
-  learningLoop().catch(console.error);
+  startLearningService();
 });
